@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="hi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Funding Arbitrage Scanner</title>
+<style>
+:root{--bg:#f6f7f5;--fg:#17201c;--mut:#6b7670;--line:#dde2dd;--card:#fff;--hi:#0a7a43;--lo:#b4261f;--acc:#1d4f91}
+@media(prefers-color-scheme:dark){:root{--bg:#121714;--fg:#e6ece8;--mut:#8b968f;--line:#27302b;--card:#1a211d;--hi:#4fd48d;--lo:#ff7b72;--acc:#7fb0ee}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.4 system-ui,sans-serif}
+header{padding:16px 20px;display:flex;flex-wrap:wrap;gap:12px;align-items:center;border-bottom:1px solid var(--line)}
+h1{font-size:18px;margin:0 12px 0 0}
+input,button{font:inherit;color:var(--fg);background:var(--card);border:1px solid var(--line);border-radius:6px;padding:6px 10px}
+button{cursor:pointer}button:focus-visible,th:focus-visible,input:focus-visible{outline:2px solid var(--acc)}
+#status{display:flex;flex-wrap:wrap;gap:6px;padding:10px 20px;font-size:12px}
+.chip{padding:2px 8px;border-radius:10px;border:1px solid var(--line);color:var(--mut)}
+.chip.ok{color:var(--hi);border-color:var(--hi)}.chip.err{color:var(--lo);border-color:var(--lo)}
+.wrap{overflow:auto;max-height:calc(100vh - 140px);margin:0 20px 20px;border:1px solid var(--line);border-radius:8px;background:var(--card)}
+table{border-collapse:collapse;width:100%;white-space:nowrap}
+th,td{padding:7px 12px;text-align:right;border-bottom:1px solid var(--line)}
+th:first-child,td:first-child{text-align:left;position:sticky;left:0;background:var(--card);font-weight:600}
+thead th{position:sticky;top:0;background:var(--card);cursor:pointer;user-select:none;z-index:2}
+thead th:first-child{z-index:3}
+th .ar{display:inline-block;width:1em;color:var(--acc)}
+td.hi{color:var(--hi);font-weight:600}td.lo{color:var(--lo);font-weight:600}td.na{color:var(--mut)}
+td.gap{font-weight:600}.star{cursor:pointer;color:var(--acc);margin-right:4px}button[aria-pressed=true]{border-color:var(--acc);color:var(--acc);font-weight:600}td small{color:var(--mut);font-weight:400}
+</style>
+</head>
+<body>
+<header>
+  <h1>Funding Arbitrage Scanner</h1>
+  <input id="q" placeholder="Coin search (BTC, ETH...)" aria-label="Coin search">
+  <label>Min gap % <input id="mg" type="number" step="0.001" value="0" style="width:90px"></label>
+  <button id="rf">Refresh</button>
+  <button id="wv" aria-pressed="false">⭐ Watchlist (0)</button>
+  <input id="wa" placeholder="Coin add karo (jaise PEPE)" style="width:170px" aria-label="Watchlist me coin add karo">
+  <button id="wb">Add</button>
+  <span id="ts" style="color:var(--mut)"></span>
+</header>
+<div id="status"></div>
+<div class="wrap"><table><thead id="th"></thead><tbody id="tb"></tbody></table></div>
+
+<script>
+/* ---------- Config ----------
+   Rate = % per funding interval. Interval = hours.
+   Har adapter { coin: {r: rate%, h: hours} } return karta hai. */
+const f = async (u) => { const r = await fetch(u); if (!r.ok) throw new Error(r.status); return r.json(); };
+// KuCoin direct CORS block karta ho to public CORS proxy se try karta hai (sirf public data)
+const fk = async (u, opt) => {
+  const tries = [u, 'https://corsproxy.io/?url=' + encodeURIComponent(u), ...(opt ? [] : ['https://api.allorigins.win/raw?url=' + encodeURIComponent(u)])];
+  let last;
+  for (const t of tries) { try { const r = await fetch(t, opt); if (r.ok) return await r.json(); last = new Error(r.status); } catch (e) { last = e; } }
+  throw last;
+};
+const norm = (s) => s.replace(/(_|-)?(USDT|USD|USDC)(M|-SWAP)?$/,'').replace(/^XBT$/,'BTC').replace(/^(1000000|1000)/,'').replace(/[-_]/g,'');
+
+/* Delta ka asli interval: har coin ki FUNDING history (hourly) dekh kar, rate kab badalta hai usse nikalta hai */
+let DH = {};
+try { const z = JSON.parse(localStorage.getItem('delta_h') || '{}'); if (z.t && Date.now() - z.t < 12 * 36e5) DH = z.m || {}; } catch (e) {}
+function stepBase(a){
+  let n = 0, df = 0; const ch = [];
+  for (let i = 1; i < a.length; i++) { if (a[i].t - a[i-1].t !== 36e5) continue; n++;
+    if (Math.abs(a[i].r - a[i-1].r) > 1e-12) { df++; ch.push(i); } }
+  if (n < 24 || df / n > 0.5 || ch.length < 3) return null;   // step series nahi
+  const cnt = {}; ch.slice(1).forEach((v, j) => { const g = Math.round((a[v].t - a[ch[j]].t) / 36e5); if (g >= 1 && g <= 8) cnt[g] = (cnt[g] || 0) + 1; });
+  const k = Object.keys(cnt).sort((x, y) => cnt[y] - cnt[x] || x - y)[0];
+  return k ? +k : null;
+}
+async function deltaIntervals(){
+  const syms = Object.values(DATA['Delta'] || {}).map(v => v.id).filter(id => !DH[id]); if (!syms.length) return;
+  const e = Math.floor(Date.now() / 1000), st = e - 96 * 3600; let i = 0;
+  await Promise.all(Array.from({length:6}, async () => { while (i < syms.length) { const id = syms[i++];
+    try { const r = (await f(`https://api.india.delta.exchange/v2/history/candles?symbol=FUNDING:${id}&resolution=1h&start=${st}&end=${e}`)).result;
+      const b = stepBase(r.map(x => ({t:(x.time + 3600) * 1000, r:+x.close})).sort((p, q) => p.t - q.t)); if (b) DH[id] = b; } catch (err) {} } }));
+  try { localStorage.setItem('delta_h', JSON.stringify({t:Date.now(), m:DH})); } catch (e) {}
+  Object.values(DATA['Delta'] || {}).forEach(v => { if (DH[v.id]) v.h = DH[v.id]; });
+  const c = document.getElementById('s-Delta'); if (c) c.textContent = `Delta: ${Object.keys(DATA['Delta']).length} (interval pakde: ${Object.values(DATA['Delta']).filter(v => DH[v.id]).length})`;
+  render();
+}
+const EX = {
+ 'Binance': async () => {
+   const [p, info] = await Promise.all([f('https://fapi.binance.com/fapi/v1/premiumIndex'), f('https://fapi.binance.com/fapi/v1/fundingInfo').catch(()=>[])]);
+   const iv = {}; info.forEach(i => iv[i.symbol] = i.fundingIntervalHours);
+   const o = {}; p.filter(x => x.symbol.endsWith('USDT')).forEach(x => o[norm(x.symbol)] = {r:+x.lastFundingRate*100, h:iv[x.symbol]||8});
+   return o; },
+ 'Bybit': async () => {
+   const d = await f('https://api.bybit.com/v5/market/tickers?category=linear'); const o = {};
+   d.result.list.filter(x => x.symbol.endsWith('USDT') && x.fundingRate !== '').forEach(x => o[norm(x.symbol)] = {r:+x.fundingRate*100, h:+x.fundingIntervalHour||8, id:x.symbol});
+   return o; },
+ 'OKX': async () => {
+   const d = await f('https://www.okx.com/api/v5/public/funding-rate?instId=ANY'); const o = {};
+   d.data.filter(x => x.instId.endsWith('-USDT-SWAP')).forEach(x => { const h = (+x.nextFundingTime - +x.fundingTime)/36e5;
+     o[norm(x.instId.replace('-SWAP',''))] = {r:+x.fundingRate*100, h:h>0?Math.round(h*100)/100:8, id:x.instId}; });
+   return o; },
+ 'Bitget': async () => {
+   const d = await f('https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES'); const o = {};
+   d.data.forEach(x => { if (x.fundingRate !== '' && x.fundingRate != null) o[norm(x.symbol)] = {r:+x.fundingRate*100, h:8, id:x.symbol}; });
+   return o; },
+ 'KuCoin': async () => {
+   const d = await fk('https://api-futures.kucoin.com/api/v1/contract/active'); const o = {};
+   d.data.filter(x => x.symbol.endsWith('USDTM') && x.fundingFeeRate != null).forEach(x => o[norm(x.symbol)] = {r:x.fundingFeeRate*100, h:(x.fundingRateGranularity||288e5)/36e5, id:x.symbol});
+   return o; },
+ 'Gate.io': async () => {
+   const d = await f('https://api.gateio.ws/api/v4/futures/usdt/contracts'); const o = {};
+   d.forEach(x => o[norm(x.name)] = {r:+x.funding_rate*100, h:(x.funding_interval||28800)/3600, id:x.name});
+   return o; },
+ 'Delta': async () => {
+   // Delta India. funding_rate is already in % hai (verify karna: BTC pe ~0.01 aana chahiye)
+   const d = await f('https://api.india.delta.exchange/v2/tickers?contract_types=perpetual_futures'); const o = {};
+   d.result.forEach(x => { if (x.funding_rate != null && x.funding_rate !== '') o[norm(x.symbol)] = {r:+x.funding_rate, h:DH[x.symbol] || 8, id:x.symbol}; });
+   return o; },
+ // Neeche 3 ke liye public funding endpoint confirm nahi hai. URL mil jaye to yahan bharo.
+ 'CoinDCX':   null,
+ 'CoinSwitch': null,
+ 'Mudrex':    null,
+};
+const names = Object.keys(EX);
+const fmtH = h => (Number.isInteger(h) ? h : h.toFixed(2)) + 'h';
+let DATA = {}, sort = {col:'gap', dir:'desc', clicks:0};
+
+let WL = [], wlView = false;
+try { WL = JSON.parse(localStorage.getItem('wl') || '[]'); } catch (e) {}
+function saveWL(){ let ok = true; try { localStorage.setItem('wl', JSON.stringify(WL)); } catch (e) { ok = false; }
+  const b = document.getElementById('wv'); b.textContent = `⭐ Watchlist (${WL.length})`; b.setAttribute('aria-pressed', wlView);
+  if (!ok) document.getElementById('ts').textContent = 'Watchlist save nahi ho paa rahi (browser storage block hai)'; }
+function render(){
+  const q = document.getElementById('q').value.trim().toUpperCase();
+  const mg = +document.getElementById('mg').value || 0;
+  const coins = {};
+  names.forEach(n => Object.keys(DATA[n]||{}).forEach(c => (coins[c] = coins[c]||{})[n] = DATA[n][c]));
+  const empty = c => ({c, m:coins[c] || {}, hi:null, lo:null, gap:null});
+  let rows = (wlView ? WL : Object.keys(coins)).map(c => {
+    const m = coins[c] || {};
+    const e = Object.entries(m).map(([n, v]) => ({n, r:v.r, h:v.h, x:v.r/v.h*8})); // 8h-normalized
+    if (e.length < 2) return wlView ? empty(c) : null;
+    const hi = e.reduce((a,b) => b.x > a.x ? b : a), lo = e.reduce((a,b) => b.x < a.x ? b : a);
+    return {c, m, hi, lo, gap:hi.x - lo.x};
+  }).filter(r => r && r.c.includes(q) && (wlView || r.gap >= mg));
+  const key = r => sort.col === 'gap' ? r.gap : sort.col === 'coin' ? r.c : (r.m[sort.col] ? r.m[sort.col].r/r.m[sort.col].h*8 : null);
+  rows.sort((a,b) => { const x = key(a), y = key(b);
+    if (x === null) return 1; if (y === null) return -1;
+    const d = typeof x === 'string' ? x.localeCompare(y) : x - y; return sort.dir === 'desc' ? -d : d; });
+  const arrow = c => sort.col === c ? (sort.dir === 'desc' ? '▼' : '▲') : '';
+  document.getElementById('th').innerHTML = '<tr>' +
+    ['coin',...names,'gap'].map(c => `<th tabindex="0" data-c="${c}">${c==='coin'?'Coin':c==='gap'?'Gap % (8h)':c} <span class="ar">${arrow(c)}</span></th>`).join('') + '</tr>';
+  document.getElementById('tb').innerHTML = (wlView && !rows.length ? `<tr><td colspan="${names.length + 2}" class="na" style="text-align:left">${WL.length ? 'Search se koi coin match nahi hua' : 'Watchlist khali hai. Upar coin add karo, ya table mein ☆ dabao.'}</td></tr>` : '') +
+    rows.slice(0, 600).map(r => `<tr><td><span class="star" role="button" tabindex="0" data-star="${r.c}" title="Watchlist me add/hatao">${WL.includes(r.c) ? '★' : '☆'}</span>${r.c}</td>` +
+    names.map(n => { const v = r.m[n]; if (!v) return '<td class="na">–</td>';
+      const cls = r.hi && n === r.hi.n ? 'hi' : r.lo && n === r.lo.n ? 'lo' : '';
+      return `<td class="${cls}">${v.r.toFixed(4)}% / <small>${fmtH(v.h)}</small></td>`; }).join('') +
+    (r.gap === null ? '<td class="gap na">–</td>' : `<td class="gap">${r.gap.toFixed(4)}% <small>${r.hi.n} ↑ / ${r.lo.n} ↓</small></td>`) + '</tr>').join('');
+}
+
+const toggleStar = c => { const i = WL.indexOf(c); if (i < 0) WL.push(c); else WL.splice(i, 1); saveWL(); render(); };
+document.getElementById('tb').addEventListener('click', e => { const s = e.target.closest('[data-star]'); if (s) toggleStar(s.dataset.star); });
+document.getElementById('tb').addEventListener('keydown', e => { if (e.key === 'Enter' && e.target.dataset.star) toggleStar(e.target.dataset.star); });
+document.getElementById('wv').onclick = () => { wlView = !wlView; saveWL(); render(); };
+const addWL = () => { const i = document.getElementById('wa'); const c = norm(i.value.trim().toUpperCase()); if (!c) return;
+  if (!WL.includes(c)) WL.push(c); i.value = ''; saveWL(); render(); };
+document.getElementById('wb').onclick = addWL;
+document.getElementById('wa').addEventListener('keydown', e => { if (e.key === 'Enter') addWL(); });
+saveWL();
+// Header click: pehle click = highest, doosra click = lowest, phir toggle
+document.getElementById('th').addEventListener('click', e => {
+  const th = e.target.closest('th'); if (!th) return; const c = th.dataset.c;
+  if (sort.col === c) sort.dir = sort.dir === 'desc' ? 'asc' : 'desc';
+  else { sort.col = c; sort.dir = c === 'coin' ? 'asc' : 'desc'; }
+  render();
+});
+document.getElementById('th').addEventListener('keydown', e => { if (e.key === 'Enter') e.target.click(); });
+['q','mg'].forEach(id => document.getElementById(id).addEventListener('input', render));
+document.getElementById('rf').onclick = load;
+
+async function load(){
+  const st = document.getElementById('status'); st.innerHTML = names.map(n => `<span class="chip" id="s-${n}">${n}…</span>`).join('');
+  await Promise.all(names.map(async n => {
+    const chip = document.getElementById('s-' + n);
+    if (!EX[n]) { chip.textContent = n + ': endpoint set nahi'; return; }
+    try { DATA[n] = await EX[n](); chip.className = 'chip ok'; chip.textContent = `${n}: ${Object.keys(DATA[n]).length}` + (seen[n] ? ' LIVE' : ''); render(); }
+    catch (err) { chip.className = 'chip err'; chip.textContent = `${n}: error (${err.message})`; }
+  }));
+  document.getElementById('ts').textContent = 'Updated ' + new Date().toLocaleTimeString();
+  render();
+}
+// Binance live: mark price stream ka "r" field = current funding rate (har 1 sec)
+let ws, lastDraw = 0;
+function binanceLive(){
+  ws = new WebSocket('wss://fstream.binance.com/ws/!markPrice@arr@1s');
+  ws.onmessage = ev => {
+    const b = DATA['Binance'] = DATA['Binance'] || {};
+    JSON.parse(ev.data).forEach(x => { if (!x.s.endsWith('USDT') || x.r === '') return;
+      const k = norm(x.s); b[k] = {r:+x.r*100, h:(b[k] && b[k].h) || 8}; });
+    const chip = document.getElementById('s-Binance');
+    if (chip) { chip.className = 'chip ok'; chip.textContent = `Binance: LIVE ${Object.keys(b).length}`; }
+    if (Date.now() - lastDraw > 2000) { lastDraw = Date.now(); render(); }
+  };
+  ws.onclose = () => setTimeout(binanceLive, 3000);
+}
+// ---- Bybit, OKX, Bitget, Gate.io live WebSockets ----
+const seen = {}; let pend = 0;
+function setRate(n, id, frac){
+  const d = DATA[n]; if (!d) return;
+  for (const c in d) if (d[c].id === id) { d[c].r = +frac*100; break; }
+  seen[n] = true; const chip = document.getElementById('s-' + n);
+  if (chip) { chip.className = 'chip ok'; chip.textContent = `${n}: ${Object.keys(d).length} LIVE`; }
+  if (!pend) pend = setTimeout(() => { pend = 0; render(); }, 2000);
+}
+const ids = n => Object.values(DATA[n] || {}).map(v => v.id).filter(Boolean);
+const chunk = (a, k) => Array.from({length:Math.ceil(a.length/k)}, (_, i) => a.slice(i*k, i*k+k));
+function startWS(n, url, sub, onMsg, ping){
+  const go = () => { const w = new WebSocket(url); let t;
+    w.onopen = () => { sub(w); if (ping) t = setInterval(() => w.readyState === 1 && w.send(ping()), 20000); };
+    w.onmessage = ev => { let m; try { m = JSON.parse(ev.data); } catch { return; } onMsg(m); };
+    w.onclose = () => { clearInterval(t); setTimeout(go, 3000); };
+    w.onerror = () => w.close(); };
+  go();
+}
+function otherLive(){
+  startWS('Bybit', 'wss://stream.bybit.com/v5/public/linear',
+    w => chunk(ids('Bybit'), 200).forEach(g => w.send(JSON.stringify({op:'subscribe', args:g.map(i => 'tickers.' + i)}))),
+    m => { if (m.topic && m.data && m.data.fundingRate != null && m.data.fundingRate !== '') setRate('Bybit', m.data.symbol, m.data.fundingRate); },
+    () => JSON.stringify({op:'ping'}));
+  startWS('OKX', 'wss://ws.okx.com:8443/ws/v5/public',
+    w => chunk(ids('OKX'), 100).forEach(g => w.send(JSON.stringify({op:'subscribe', args:g.map(i => ({channel:'funding-rate', instId:i}))}))),
+    m => { if (m.data && m.arg && m.arg.channel === 'funding-rate') m.data.forEach(x => setRate('OKX', x.instId, x.fundingRate)); },
+    () => 'ping');
+  startWS('Bitget', 'wss://ws.bitget.com/v2/ws/public',
+    w => chunk(ids('Bitget'), 100).forEach(g => w.send(JSON.stringify({op:'subscribe', args:g.map(i => ({instType:'USDT-FUTURES', channel:'ticker', instId:i}))}))),
+    m => { if (m.data && m.arg && m.arg.channel === 'ticker') m.data.forEach(x => x.fundingRate !== '' && x.fundingRate != null && setRate('Bitget', x.instId, x.fundingRate)); },
+    () => 'ping');
+  startWS('Gate.io', 'wss://fx-ws.gateio.ws/v4/ws/usdt',
+    w => chunk(ids('Gate.io'), 100).forEach(g => w.send(JSON.stringify({time:Math.floor(Date.now()/1000), channel:'futures.tickers', event:'subscribe', payload:g}))),
+    m => { if (m.channel === 'futures.tickers' && m.event === 'update' && Array.isArray(m.result)) m.result.forEach(x => x.funding_rate != null && setRate('Gate.io', x.contract, x.funding_rate)); },
+    () => JSON.stringify({time:Math.floor(Date.now()/1000), channel:'futures.ping'}));
+}
+function deltaLive(){
+  // Naya public endpoint (purana socket.india.delta.exchange 31 Jul 2026 se hat raha hai)
+  startWS('Delta', 'wss://public-socket.india.delta.exchange',
+    w => chunk(ids('Delta'), 100).forEach(g => w.send(JSON.stringify({type:'subscribe', payload:{channels:[{name:'funding_rate', symbols:g}]}}))),
+    m => { if (m.type === 'funding_rate') { const r = m.fr ?? m.funding_rate, sy = m.sy || m.symbol; if (r != null && sy) setRate('Delta', sy, +r/100); } });
+}
+async function kucoinLive(){
+  let t;
+  try {
+    const b = await fk('https://api-futures.kucoin.com/api/v1/bullet-public', {method:'POST'});
+    const sv = b.data.instanceServers[0];
+    const w = new WebSocket(`${sv.endpoint}?token=${b.data.token}&connectId=fs${Date.now()}`);
+    w.onopen = () => { chunk(ids('KuCoin'), 100).forEach((g, i) => w.send(JSON.stringify({id:Date.now()+i, type:'subscribe', topic:'/contract/instrument:' + g.join(','), response:true})));
+      t = setInterval(() => w.readyState === 1 && w.send(JSON.stringify({id:Date.now(), type:'ping'})), (sv.pingInterval||18000) - 2000); };
+    w.onmessage = ev => { let m; try { m = JSON.parse(ev.data); } catch { return; }
+      if (m.subject === 'funding.rate' && m.data) setRate('KuCoin', m.topic.split(':')[1], m.data.fundingRate); };
+    w.onclose = () => { clearInterval(t); setTimeout(kucoinLive, 3000); };
+    w.onerror = () => w.close();
+  } catch (e) { setTimeout(kucoinLive, 10000); }
+}
+load().then(() => { binanceLive(); otherLive(); deltaLive(); kucoinLive(); deltaIntervals(); }); setInterval(load, 60000);
+</script>
+</body>
+</html>
